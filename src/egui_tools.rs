@@ -5,6 +5,8 @@ use egui_winit::State;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
+use egui_material_icons;
+
 pub struct EguiRenderer {
     state: State,
     renderer: Renderer,
@@ -24,6 +26,8 @@ impl EguiRenderer {
         window: &Window,
     ) -> EguiRenderer {
         let egui_context = Context::default();
+
+        egui_material_icons::initialize(&egui_context);
 
         let egui_state = egui_winit::State::new(
             egui_context,
