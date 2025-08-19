@@ -1,7 +1,22 @@
+use anyhow::Context;
+use clap;
+use futures::executor::block_on;
+use wasi_frame_buffer_wasmtime::WasiFrameBufferView;
+use wasi_graphics_context_wasmtime::WasiGraphicsContextView;
+use wasi_surface_wasmtime::{Surface, SurfaceDesc, WasiSurfaceView, SurfaceProxy, WasiWinitEventLoopProxy};
+use wasi_webgpu_wasmtime::WasiWebGpuView;
+use wasmtime::{
+    component::{Component, Linker},
+    Config, Engine, Store,
+};
+
+use wasmtime_wasi::{IoView, ResourceTable};
+
+use std::collections::HashMap;
 use crate::egui_tools::EguiRenderer;
 use egui_wgpu::wgpu::SurfaceError;
 use egui_wgpu::{wgpu, ScreenDescriptor};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize, Position};
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -9,12 +24,101 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 use winit::raw_window_handle::HasRawWindowHandle;
+use winit::keyboard::ModifiersState;
 
 use egui_commonmark::*;
-use pulldown_cmark::{Parser, Options};
+use pulldown_cmark::{Parser as PullDownParser, Options};
 
 #[path = "fill.rs"]
 mod fill;
+
+#[derive(clap::Parser, Debug)]
+struct RuntimeArgs {
+    /// The example name
+    #[arg(long)]
+    example: String,
+}
+
+wasmtime::component::bindgen!({
+    path: "wasi-gfx-runtime/wit/",
+    world: "example",
+    async: {
+        only_imports: [],
+    },
+    with: {
+        "wasi:graphics-context/graphics-context": wasi_graphics_context_wasmtime::wasi::graphics_context::graphics_context,
+        "wasi:surface/surface": wasi_surface_wasmtime::wasi::surface::surface,
+        "wasi:frame-buffer/frame-buffer": wasi_frame_buffer_wasmtime::wasi::frame_buffer::frame_buffer,
+        "wasi:webgpu/webgpu": wasi_webgpu_wasmtime::wasi::webgpu::webgpu,
+    },
+});
+
+struct HostState {
+    pub table: ResourceTable,
+    pub instance: Arc<wgpu_core::global::Global>,
+    pub main_thread_proxy: wasi_surface_wasmtime::WasiWinitEventLoopProxy,
+}
+
+impl HostState {
+    fn new(main_thread_proxy: wasi_surface_wasmtime::WasiWinitEventLoopProxy) -> Self {
+        Self {
+            table: ResourceTable::new(),
+            instance: Arc::new(wgpu_core::global::Global::new(
+                "webgpu",
+                &wgpu_types::InstanceDescriptor {
+                    backends: wgpu_types::Backends::all(),
+                    flags: wgpu_types::InstanceFlags::from_build_config(),
+                    backend_options: Default::default(),
+                },
+            )),
+            main_thread_proxy,
+        }
+    }
+}
+
+impl IoView for HostState {
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+}
+
+impl WasiGraphicsContextView for HostState {}
+impl WasiFrameBufferView for HostState {}
+
+struct UiThreadSpawner(wasi_surface_wasmtime::WasiWinitEventLoopProxy);
+
+impl wasi_webgpu_wasmtime::MainThreadSpawner for UiThreadSpawner {
+    async fn spawn<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce() -> T + Send + Sync + 'static,
+        T: Send + Sync + 'static,
+    {
+        self.0.spawn(f).await
+    }
+}
+
+impl WasiWebGpuView for HostState {
+    fn instance(&self) -> Arc<wgpu_core::global::Global> {
+        Arc::clone(&self.instance)
+    }
+
+    fn ui_thread_spawner(&self) -> Box<impl wasi_webgpu_wasmtime::MainThreadSpawner + 'static> {
+        Box::new(UiThreadSpawner(self.main_thread_proxy.clone()))
+    }
+}
+
+impl WasiSurfaceView for HostState {
+    fn create_canvas(&self, desc: SurfaceDesc) -> Surface {
+        block_on(self.main_thread_proxy.create_window(desc))
+    }
+}
+
+impl ExampleImports for HostState {
+    fn print(&mut self, s: String) {
+        println!("{s}");
+    }
+}
+
 
 #[derive(Clone)]
 struct Tab {
@@ -126,6 +230,11 @@ pub struct App {
     current_tab: String,
     current_page: String,
     tabs: Vec<Tab>,
+
+    pointer_pos: HashMap<WindowId, (f64, f64)>,
+    modifiers: HashMap<WindowId, ModifiersState>,
+    proxies: HashMap<WindowId, SurfaceProxy>,
+    arc_proxies: Arc<Mutex<HashMap<WindowId, SurfaceProxy>>>,
 }
 
 impl App {
@@ -150,6 +259,10 @@ impl App {
                 back: Vec::new(),
                 forward: Vec::new(),
             }],
+            pointer_pos: HashMap::new(),
+            modifiers: HashMap::new(),
+            proxies: HashMap::new(),
+            arc_proxies: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -441,7 +554,7 @@ impl ApplicationHandler for App {
         pollster::block_on(self.set_window(window));
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
         // let egui render to process the event first
         self.state
             .as_mut()
@@ -456,6 +569,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.handle_redraw();
+                self.parent_window_id = window_id;
 
                 self.window.as_ref().unwrap().request_redraw();
                 if self.child_window_id != 2.into() {
@@ -468,23 +582,112 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(new_size) => {
                 self.handle_resized(new_size.width, new_size.height);
             }
-            WindowEvent::KeyboardInput {
-                event:
+            //WindowEvent::KeyboardInput {
+            //    event:
+            //        KeyEvent {
+            //            physical_key: PhysicalKey::Code(KeyCode::KeyM),
+            //            state: ElementState::Pressed,
+            //            repeat: false,
+            //            ..
+            //        },
+            //    ..
+            //} => {
+            //    println!("M key pressed");
+            //    //let child_window = spawn_child_window(&Arc::try_unwrap(self.window.unwrap().unwrap(), event_loop);
+            //    self.child_window = Some(spawn_child_window(self.window.as_ref().unwrap().as_ref(), event_loop));
+            //    let child_id = self.child_window.as_ref().unwrap().id();
+            //    println!("Child window created with id: {child_id:?}");
+            //    self.child_window_id = child_id;
+            //},
+
+            WindowEvent::CursorMoved { position, .. } => {
+
+                if self.parent_window_id != 1.into() {
+                    self.pointer_pos
+                        .insert(self.parent_window_id, (position.x, position.y));
+                    if let Some(proxy) = self.proxies.get(&window_id) {
+                        proxy.pointer_move(wasi_surface_wasmtime::PointerEvent {
+                            x: position.x,
+                            y: position.y,
+                        });
+                    }
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers.insert(window_id, modifiers.state());
+            }
+            WindowEvent::KeyboardInput { event: input, .. } => {
+                match input {
                     KeyEvent {
                         physical_key: PhysicalKey::Code(KeyCode::KeyM),
                         state: ElementState::Pressed,
                         repeat: false,
                         ..
+                    } => {
+
+                        println!("M key pressed");
+                        //let child_window = spawn_child_window(&Arc::try_unwrap(self.window.unwrap().unwrap(), event_loop);
+                        self.child_window = Some(spawn_child_window(self.window.as_ref().unwrap().as_ref(), event_loop));
+                        let child_id = self.child_window.as_ref().unwrap().id();
+                        println!("Child window created with id: {child_id:?}");
+                        self.child_window_id = child_id;
                     },
-                ..
-            } => {
-                println!("M key pressed");
-                //let child_window = spawn_child_window(&Arc::try_unwrap(self.window.unwrap().unwrap(), event_loop);
-                self.child_window = Some(spawn_child_window(self.window.as_ref().unwrap().as_ref(), event_loop));
-                let child_id = self.child_window.as_ref().unwrap().id();
-                println!("Child window created with id: {child_id:?}");
-                self.child_window_id = child_id;
-            },
+                    _ => {}
+                }
+                let modifiers = self.modifiers.get(&window_id).unwrap();
+                let event = wasi_surface_wasmtime::KeyEvent {
+                    key: match input.physical_key {
+                        winit::keyboard::PhysicalKey::Code(code) => code.try_into().ok(),
+                        winit::keyboard::PhysicalKey::Unidentified(_) => None,
+                    },
+                    text: match input.logical_key {
+                        winit::keyboard::Key::Character(char) => Some(char.to_string()),
+                        winit::keyboard::Key::Named(_)
+                        | winit::keyboard::Key::Unidentified(_)
+                        | winit::keyboard::Key::Dead(_) => None,
+                    },
+                    alt_key: modifiers.alt_key(),
+                    ctrl_key: modifiers.control_key(),
+                    meta_key: modifiers.super_key(),
+                    shift_key: modifiers.shift_key(),
+                };
+                if let Some(proxy) = self.proxies.get(&window_id) {
+                    match input.state {
+                        ElementState::Pressed => {
+                            proxy.key_down(event);
+                        }
+                        ElementState::Released => {
+                            proxy.key_up(event);
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, .. } => {
+                let (pointer_x, pointer_y) = self.pointer_pos.get(&window_id).unwrap();
+                let event = wasi_surface_wasmtime::PointerEvent {
+                    x: *pointer_x,
+                    y: *pointer_y,
+                };
+                if let Some(proxy) = self.proxies.get(&window_id) {
+                    match state {
+                        ElementState::Pressed => {
+                            proxy.pointer_down(event);
+                        }
+                        ElementState::Released => {
+                            proxy.pointer_up(event);
+                        }
+                    }
+                }
+            }
+            WindowEvent::Resized(new_size) => {
+                if let Some(proxy) = self.proxies.get(&window_id) {
+                    proxy.canvas_resize(wasi_surface_wasmtime::ResizeEvent {
+                        height: new_size.height,
+                        width: new_size.width,
+                    });
+                }
+            }
+
             _ => (),
         }
     }
@@ -527,18 +730,90 @@ pub fn navigate(location: String) -> String {
     // Implement navigation logic here
     // For now, just return Ok
     println!("Navigating to URL: {}", location);
-    let resp = reqwest::blocking::get(location)
+    let resp = reqwest::blocking::get(&location)
         .and_then(|r| r.text())
         .map_err(|e| e.to_string());
+
+    // if the location ends with .wasm we'll try loading it
+    if location.ends_with(".wasm") {
+        let wasm_bytes = resp.unwrap_or_else(|_| {
+            eprintln!("Failed to load wasm file at {}", location);
+            return "Failed to load wasm file".to_string();
+        });
+        // save wasm_bytes to a file
+        let wasm_path = format!("./{}.wasm", location.replace("https://", "").replace("/", "_"));
+        std::fs::write(&wasm_path, wasm_bytes).unwrap_or_else(|_| {
+            eprintln!("Failed to write wasm file to {}", wasm_path);
+        });
+        //env_logger::builder()
+        //    .filter_level(log::LevelFilter::Info)
+        //    .init();
+
+        let mut config = Config::default();
+        config.wasm_component_model(true);
+        config.async_support(true);
+        let engine = match Engine::new(&config) {
+            Ok(engine) => engine,
+            Err(e) => {
+                println!("Failed to create Wasmtime engine: {}", e);
+                return "Failed to create Wasmtime engine".to_string();
+            }
+        };
+        let mut linker: Linker<HostState> = Linker::new(&engine);
+
+        wasi_webgpu_wasmtime::add_to_linker(&mut linker);
+        wasi_frame_buffer_wasmtime::add_to_linker(&mut linker);
+        wasi_graphics_context_wasmtime::add_to_linker(&mut linker);
+        wasi_surface_wasmtime::add_to_linker(&mut linker);
+
+        fn type_annotate<F>(val: F) -> F
+        where
+            F: Fn(&mut HostState) -> &mut dyn ExampleImports,
+        {
+            val
+        }
+        let closure = type_annotate::<_>(|t| t);
+        Example::add_to_linker_imports_get_host(&mut linker, closure);
+
+        println!("about to call wasi_winit_event_loop");
+
+        //let main_thread_proxy = WasiWinitEventLoopProxy {
+        //    proxy: event_loop.event_loop.create_proxy(),
+        //};
+
+        //let host_state = HostState::new(main_thread_proxy);
+
+        //let mut store = Store::new(&engine, host_state);
+
+        //let component =
+        //    match Component::from_file(&engine, &wasm_path).context("Component file not found") {
+        //        Ok(component) => component,
+        //        Err(e) => {
+        //            println!("Failed to load component: {}", e);
+        //            return "Failed to load component".to_string();
+        //        }
+        //    };
+
+
+        //tokio::spawn(async move {
+        //    let instance = Example::instantiate_async(&mut store, &component, &linker)
+        //        .await
+        //        .unwrap();
+        //    instance.call_start(&mut store).await.unwrap();
+        //});
+
+        //return "Wasm file loaded and running".to_string();
+        return;
+    }
     //println!("{:#?}", resp);
     //self.current_status = "Loaded".to_string();
-    return resp.unwrap_or_else(|_| "Failed to load page".to_string());
+    //return resp.unwrap_or_else(|_| "Failed to load page".to_string());
 }
 
 fn get_heading(contents: String) -> String {
     let mut heading = String::new();
     let mut in_heading = false;
-    let parser = Parser::new_ext(&contents, Options::empty());
+    let parser = PullDownParser::new_ext(&contents, Options::empty());
     for event in parser {
         match event {
             pulldown_cmark::Event::Start(pulldown_cmark::Tag::Heading { .. }) => {

@@ -1,0 +1,3 @@
+[submodule "wasi-gfx-runtime"]
+	path = wasi-gfx-runtime
+	url = git@github.com:wasi-gfx/wasi-gfx-runtime.git
