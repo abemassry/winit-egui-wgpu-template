@@ -1,14 +1,19 @@
-# Starter Template for winit, egui and wgpu
+# The M Browser
 
-Get started with [winit](https://github.com/rust-windowing/winit), [egui](https://github.com/emilk/egui) and [wgpu](https://github.com/gfx-rs/wgpu).
+## Overview
 
-Like `SDL2` more than `winit`? Check out [egui-sdl2-event-example](https://github.com/kaphula/egui-sdl2-event/tree/master/egui-sdl2-event-example).
+The web and the web browser had a lot of good ideas. Maybe we can take some of those good ideas
+and combine it with the utility of the web that puts the power of the web back in the hands of the user.
 
-`cargo run`
+## Features
 
+- **Display Markdown**: Display markdown files by default.
+- **JSON format**: Display Markdown and or wasm files if specified in a json file. (planned
+  feature)
+- **Display WASM**: Display wasm files in a canvas that renders by default. (planned feature)
+- **Legacy Webpages**: Display legacy webpages in a container that runs a full system including a
+  browser, through wasm, that renders to a canvas. (planned feature)
 
-## Change logs 
+## Example inside the M Browser
 
-### version: 0.3.0
-- porting to winit 0.30.5 and egui 0.29.1
-- remove egui drawing closure in favor of more borrow checker friendly approach.
+[Link to second page in example](https://raw.githubusercontent.com/abemassry/m-browser/refs/heads/main/pages/SECOND_PAGE.md)
